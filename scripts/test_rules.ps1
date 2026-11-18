@@ -29,22 +29,28 @@ $created = Invoke-RestMethod -Uri "$BaseUrl/products" -Method Post -Body $prodBo
 Write-Host "Created product: $($created.id) with stock: $($created.stock)"
 
 Write-Host "`n==> Testing Last Unit Concurrency (50 parallel buyers for 1 unit)"
-$results = 1..50 | ForEach-Object -Parallel {
+$jobs = 1..50 | ForEach-Object {
     $uid = "u_parallel_$_"
-    $pid = $using:prodId
-    $url = "$using:BaseUrl/orders"
-    $body = @{ userId = $uid; productId = $pid } | ConvertTo-Json
-    try {
-        $resp = Invoke-WebRequest -Uri $url -Method Post -Body $body -ContentType "application/json" -SkipHttpErrorCheck
-        $resp.StatusCode
-    } catch {
-        $_.Exception.Response.StatusCode.value__
-    }
-} -ThrottleLimit 50
+    $targetProdId = $prodId
+    $url = "$BaseUrl/orders"
+    Start-Job -ScriptBlock {
+        param($url, $uid, $targetProdId)
+        $body = @{ userId = $uid; productId = $targetProdId } | ConvertTo-Json
+        try {
+            $resp = Invoke-WebRequest -Uri $url -Method Post -Body $body -ContentType "application/json" -UseBasicParsing
+            $resp.StatusCode
+        } catch {
+            $_.Exception.Response.StatusCode.value__
+        }
+    } -ArgumentList $url, $uid, $targetProdId
+}
 
+$results = $jobs | Wait-Job | Receive-Job
+$jobs | Remove-Job
 $grouped = $results | Group-Object | Select-Object Name, Count
 Write-Host "Order status results:"
 $grouped | Format-Table -AutoSize
+
 
 $finalProd = Invoke-RestMethod -Uri "$BaseUrl/products/$prodId" -Method Get
 Write-Host "Final product stock: $($finalProd.stock)"

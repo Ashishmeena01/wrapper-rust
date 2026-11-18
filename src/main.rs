@@ -544,29 +544,53 @@ async fn main() {
         .await
         .expect("Failed to connect to PostgreSQL");
 
-    // Initialize Schema & High-Throughput Function
+    // Initialize Schema & High-Throughput Function individually
     sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS products (
+        "CREATE TABLE IF NOT EXISTS products (
             id VARCHAR(64) PRIMARY KEY,
             name VARCHAR(200) NOT NULL,
             category VARCHAR(64) NOT NULL,
             price BIGINT NOT NULL,
             stock INT NOT NULL CHECK (stock >= 0)
-        );
+        )",
+    )
+    .execute(&db)
+    .await
+    .expect("Failed to create products table");
 
-        CREATE INDEX IF NOT EXISTS idx_products_cat_price_id ON products(category, price ASC, id ASC);
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_products_cat_price_id ON products(category, price ASC, id ASC)",
+    )
+    .execute(&db)
+    .await
+    .expect("Failed to create products index");
 
-        CREATE TABLE IF NOT EXISTS orders (
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS orders (
             order_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
             product_id VARCHAR(64) NOT NULL REFERENCES products(id),
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
+        )",
+    )
+    .execute(&db)
+    .await
+    .expect("Failed to create orders table");
 
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_user_product ON orders(user_id, product_id);
-        CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_user_product ON orders(user_id, product_id)",
+    )
+    .execute(&db)
+    .await
+    .expect("Failed to create orders user_product unique index");
 
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)")
+        .execute(&db)
+        .await
+        .expect("Failed to create orders user index");
+
+    sqlx::query(
+        r#"
         CREATE OR REPLACE FUNCTION place_order(
             p_order_id TEXT,
             p_user_id TEXT,
@@ -609,7 +633,7 @@ async fn main() {
     )
     .execute(&db)
     .await
-    .expect("Failed to initialize database schema");
+    .expect("Failed to create place_order function");
 
     // Preload existing products into memory
     let mut products_map = HashMap::new();
