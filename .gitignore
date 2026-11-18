@@ -2,3 +2,7 @@
 .env.local
 .DS_Store
 Thumbs.db
+/data
+*.db
+*.db-wal
+*.db-shm

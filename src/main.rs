@@ -1,3 +1,5 @@
+mod storage;
+
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
@@ -7,9 +9,7 @@ use axum::{
     Router,
 };
 use parking_lot::RwLock;
-use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -18,11 +18,12 @@ use std::{
         atomic::{AtomicI32, AtomicU64, Ordering as AtomicOrdering},
         Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
+use storage::{Storage, StorageError};
 use tokio::net::TcpListener;
 
-// --- Zero-Allocation Views & Models ---
+// --- Models & Zero-Allocation Views ---
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProductResponse {
@@ -114,14 +115,11 @@ pub struct OrderCreatedResponse {
     pub product_id: String,
 }
 
-// --- App State with Split Fine-Grained Locks ---
-// Splitting locks eliminates cross-thread lock contention:
-// 60% of traffic (product reads) never blocks on 20% of traffic (order writes).
+// --- App State ---
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: PgPool,
-    pub redis: redis::aio::ConnectionManager,
+    pub storage: Arc<Storage>,
     pub products: Arc<RwLock<HashMap<String, Arc<ProductItem>>>>,
     pub categories: Arc<RwLock<HashMap<String, Vec<Arc<ProductItem>>>>>,
     pub user_orders: Arc<RwLock<HashMap<String, Vec<UserOrderItem>>>>,
@@ -196,106 +194,71 @@ pub async fn create_product(
     };
 
     // Fast-path in-memory check
-    {
-        if state.products.read().contains_key(&id) {
-            return json_error(StatusCode::CONFLICT, "PRODUCT_EXISTS");
-        }
+    if state.products.read().contains_key(&id) {
+        return json_error(StatusCode::CONFLICT, "PRODUCT_EXISTS");
     }
 
-    // Persist to PostgreSQL (authoritative source of truth)
-    let insert_result = sqlx::query(
-        "INSERT INTO products (id, name, category, price, stock) VALUES ($1, $2, $3, $4, $5)"
-    )
-    .bind(&id)
-    .bind(&name)
-    .bind(&category)
-    .bind(price)
-    .bind(stock)
-    .execute(&state.db)
-    .await;
+    // Persist to embedded SQLite storage
+    let insert_result = state
+        .storage
+        .create_product(&id, &name, &category, price, stock)
+        .await;
 
-    if let Err(e) = insert_result {
-        if let Some(db_err) = e.as_database_error() {
-            if db_err.is_unique_violation() {
-                return json_error(StatusCode::CONFLICT, "PRODUCT_EXISTS");
+    match insert_result {
+        Ok(_) => {
+            let product_item = Arc::new(ProductItem {
+                id: id.clone(),
+                name: name.clone(),
+                category: category.clone(),
+                price,
+                stock: AtomicI32::new(stock),
+            });
+
+            // Update in-memory catalogue and categories
+            state.products.write().insert(id.clone(), Arc::clone(&product_item));
+            {
+                let mut cats = state.categories.write();
+                let list = cats.entry(category.clone()).or_default();
+                list.push(Arc::clone(&product_item));
+                list.sort_by(|a, b| {
+                    let p = a.price.cmp(&b.price);
+                    if p == Ordering::Equal {
+                        a.id.cmp(&b.id)
+                    } else {
+                        p
+                    }
+                });
             }
+
+            json_response(StatusCode::CREATED, &product_item.as_view())
         }
-        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR");
+        Err(StorageError::ProductExists) => json_error(StatusCode::CONFLICT, "PRODUCT_EXISTS"),
+        Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
     }
-
-    let product_item = Arc::new(ProductItem {
-        id: id.clone(),
-        name: name.clone(),
-        category: category.clone(),
-        price,
-        stock: AtomicI32::new(stock),
-    });
-
-    // Update in-memory catalogue and categories
-    {
-        state.products.write().insert(id.clone(), Arc::clone(&product_item));
-        let mut cats = state.categories.write();
-        let list = cats.entry(category.clone()).or_default();
-        list.push(Arc::clone(&product_item));
-        list.sort_by(|a, b| {
-            let p = a.price.cmp(&b.price);
-            if p == Ordering::Equal {
-                a.id.cmp(&b.id)
-            } else {
-                p
-            }
-        });
-    }
-
-    // Populate Redis asynchronously
-    let mut redis_conn = state.redis.clone();
-    let redis_id = id.clone();
-    let redis_json = serde_json::to_string(&product_item.as_view()).unwrap_or_default();
-    tokio::spawn(async move {
-        let key = format!("product:{redis_id}");
-        let _: Result<(), _> = redis_conn.set_ex(key, redis_json, 60).await;
-    });
-
-    json_response(StatusCode::CREATED, &product_item.as_view())
 }
 
-// GET /products/:id (60% of all traffic)
+// GET /products/:id (60% of traffic)
 pub async fn get_product(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
     // Ultra-fast path: read from in-memory catalogue with zero string allocations
-    if let Some(item) = {
-        state.products.read().get(&id).cloned()
-    } {
+    if let Some(item) = state.products.read().get(&id).cloned() {
         return json_response(StatusCode::OK, &item.as_view());
     }
 
-    // Fallback path: query PostgreSQL if missing from memory (e.g. after fresh restart)
-    let query_result = sqlx::query(
-        "SELECT id, name, category, price, stock FROM products WHERE id = $1"
-    )
-    .bind(&id)
-    .fetch_optional(&state.db)
-    .await;
-
-    match query_result {
-        Ok(Some(row)) => {
-            let item_id: String = row.get("id");
-            let item_name: String = row.get("name");
-            let item_category: String = row.get("category");
-            let item_price: i64 = row.get("price");
-            let item_stock: i32 = row.get("stock");
-
+    // Fallback path: query embedded SQLite storage if missing from memory
+    match state.storage.get_product(&id).await {
+        Ok(Some(p)) => {
             let item = Arc::new(ProductItem {
-                id: item_id.clone(),
-                name: item_name,
-                category: item_category,
-                price: item_price,
-                stock: AtomicI32::new(item_stock),
+                id: p.id.clone(),
+                name: p.name,
+                category: p.category,
+                price: p.price,
+                stock: AtomicI32::new(p.stock),
             });
             let view = item.as_view();
-            state.products.write().insert(item_id, Arc::clone(&item));
+            state.products.write().insert(p.id, Arc::clone(&item));
             json_response(StatusCode::OK, &view)
         }
         Ok(None) => json_error(StatusCode::NOT_FOUND, "PRODUCT_NOT_FOUND"),
@@ -303,7 +266,7 @@ pub async fn get_product(
     }
 }
 
-// GET /products?category=...&page=...&limit=... (15% of all traffic)
+// GET /products?category=...&page=...&limit=... (15% of traffic)
 pub async fn list_products(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -376,41 +339,16 @@ pub async fn create_order(
     };
 
     // Fast-path in-memory checks:
-    // 1. If user already purchased, reject immediately (retries)
+    // 1. If user already purchased, reject immediately
     if state.user_purchases.read().contains(&(user_id.clone(), product_id.clone())) {
         return json_error(StatusCode::CONFLICT, "ALREADY_PURCHASED");
     }
 
-    let maybe_item = state.products.read().get(&product_id).cloned();
-
-    let item = match maybe_item {
-        Some(i) => i,
-        None => {
-            // Verify with PostgreSQL
-            let exists = sqlx::query("SELECT id FROM products WHERE id = $1")
-                .bind(&product_id)
-                .fetch_optional(&state.db)
-                .await;
-            match exists {
-                Ok(Some(_)) => {
-                    Arc::new(ProductItem {
-                        id: product_id.clone(),
-                        name: String::new(),
-                        category: String::new(),
-                        price: 0,
-                        stock: AtomicI32::new(1),
-                    })
-                }
-                Ok(None) => return json_error(StatusCode::NOT_FOUND, "PRODUCT_NOT_FOUND"),
-                Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
-            }
+    // 2. Fast terminal sold-out guard in memory
+    if let Some(item) = state.products.read().get(&product_id) {
+        if item.stock.load(AtomicOrdering::Relaxed) <= 0 {
+            return json_error(StatusCode::CONFLICT, "SOLD_OUT");
         }
-    };
-
-    // Fast terminal sold-out guard:
-    // When stock is 0 in a flash drop, immediately reject subsequent requests in RAM
-    if item.stock.load(AtomicOrdering::Relaxed) <= 0 {
-        return json_error(StatusCode::CONFLICT, "SOLD_OUT");
     }
 
     // Generate unique orderId
@@ -421,25 +359,18 @@ pub async fn create_order(
         .as_millis();
     let order_id = format!("o_{:x}{:04x}", t, (c & 0xFFFF));
 
-    // Execute atomic placement in PostgreSQL
-    let query_result = sqlx::query_scalar::<_, i32>(
-        "SELECT place_order($1, $2, $3)"
-    )
-    .bind(&order_id)
-    .bind(&user_id)
-    .bind(&product_id)
-    .fetch_one(&state.db)
-    .await;
+    // Execute atomic placement in SQLite storage engine
+    let order_res = state
+        .storage
+        .place_order(&order_id, &user_id, &product_id)
+        .await;
 
-    let status_code = match query_result {
-        Ok(s) => s,
-        _ => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
-    };
-
-    match status_code {
-        0 => {
+    match order_res {
+        Ok(()) => {
             // Success (201 Created)
-            item.stock.fetch_sub(1, AtomicOrdering::Relaxed);
+            if let Some(item) = state.products.read().get(&product_id) {
+                item.stock.fetch_sub(1, AtomicOrdering::Relaxed);
+            }
 
             let user_order = UserOrderItem {
                 order_id: order_id.clone(),
@@ -458,16 +389,18 @@ pub async fn create_order(
                 },
             )
         }
-        1 => json_error(StatusCode::NOT_FOUND, "PRODUCT_NOT_FOUND"),
-        2 => {
+        Err(StorageError::ProductNotFound) => json_error(StatusCode::NOT_FOUND, "PRODUCT_NOT_FOUND"),
+        Err(StorageError::AlreadyPurchased) => {
             state.user_purchases.write().insert((user_id, product_id));
             json_error(StatusCode::CONFLICT, "ALREADY_PURCHASED")
         }
-        3 => {
-            item.stock.store(0, AtomicOrdering::Relaxed);
+        Err(StorageError::SoldOut) => {
+            if let Some(item) = state.products.read().get(&product_id) {
+                item.stock.store(0, AtomicOrdering::Relaxed);
+            }
             json_error(StatusCode::CONFLICT, "SOLD_OUT")
         }
-        _ => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
+        Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
     }
 }
 
@@ -487,21 +420,14 @@ pub async fn get_user_orders(
         );
     }
 
-    // Query PostgreSQL
-    let rows = sqlx::query(
-        "SELECT order_id, product_id FROM orders WHERE user_id = $1"
-    )
-    .bind(&user_id)
-    .fetch_all(&state.db)
-    .await;
-
-    match rows {
+    // Query SQLite storage
+    match state.storage.get_user_orders(&user_id).await {
         Ok(list) => {
             let orders: Vec<UserOrderItem> = list
                 .into_iter()
-                .map(|r| UserOrderItem {
-                    order_id: r.get("order_id"),
-                    product_id: r.get("product_id"),
+                .map(|(order_id, product_id)| UserOrderItem {
+                    order_id,
+                    product_id,
                 })
                 .collect();
 
@@ -525,141 +451,39 @@ pub async fn not_found_handler() -> Response {
 
 #[tokio::main]
 async fn main() {
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".into());
+    let raw_db_path = env::var("DATABASE_PATH")
+        .unwrap_or_else(|_| env::var("DATABASE_URL").unwrap_or_else(|_| "./data/app.db".into()));
+    let db_path = raw_db_path.strip_prefix("sqlite://").unwrap_or(&raw_db_path);
+
     let port: u16 = env::var("PORT")
         .unwrap_or_else(|_| "8080".into())
         .parse()
         .expect("PORT must be a number");
 
-    println!("Starting Last Server Standing API on port {port}...");
+    println!("Starting Last Server Standing API with embedded storage at '{db_path}' on port {port}...");
 
-    // Configure high-performance PostgreSQL connection pool
-    let db = PgPoolOptions::new()
-        .max_connections(80)
-        .min_connections(10)
-        .acquire_timeout(Duration::from_secs(5))
-        .idle_timeout(Duration::from_secs(300))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to PostgreSQL");
+    // Initialize embedded SQLite storage
+    let storage = Arc::new(
+        Storage::new(db_path)
+            .await
+            .expect("Failed to initialize embedded storage engine"),
+    );
 
-    // Initialize Schema & High-Throughput Function individually
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS products (
-            id VARCHAR(64) PRIMARY KEY,
-            name VARCHAR(200) NOT NULL,
-            category VARCHAR(64) NOT NULL,
-            price BIGINT NOT NULL,
-            stock INT NOT NULL CHECK (stock >= 0)
-        )",
-    )
-    .execute(&db)
-    .await
-    .expect("Failed to create products table");
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_products_cat_price_id ON products(category, price ASC, id ASC)",
-    )
-    .execute(&db)
-    .await
-    .expect("Failed to create products index");
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS orders (
-            order_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(64) NOT NULL,
-            product_id VARCHAR(64) NOT NULL REFERENCES products(id),
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )",
-    )
-    .execute(&db)
-    .await
-    .expect("Failed to create orders table");
-
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_user_product ON orders(user_id, product_id)",
-    )
-    .execute(&db)
-    .await
-    .expect("Failed to create orders user_product unique index");
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)")
-        .execute(&db)
-        .await
-        .expect("Failed to create orders user index");
-
-    sqlx::query(
-        r#"
-        CREATE OR REPLACE FUNCTION place_order(
-            p_order_id TEXT,
-            p_user_id TEXT,
-            p_product_id TEXT
-        ) RETURNS INT AS $$
-        DECLARE
-            v_updated_id TEXT;
-        BEGIN
-            -- 1. Fast check if user already purchased
-            IF EXISTS (SELECT 1 FROM orders WHERE user_id = p_user_id AND product_id = p_product_id) THEN
-                RETURN 2; -- ALREADY_PURCHASED (409)
-            END IF;
-
-            -- 2. Atomic decrement in single step
-            UPDATE products
-            SET stock = stock - 1
-            WHERE id = p_product_id AND stock > 0
-            RETURNING id INTO v_updated_id;
-
-            IF v_updated_id IS NOT NULL THEN
-                INSERT INTO orders (order_id, user_id, product_id)
-                VALUES (p_order_id, p_user_id, p_product_id);
-                RETURN 0; -- SUCCESS (201)
-            END IF;
-
-            -- Check if product exists or is sold out
-            IF NOT EXISTS (SELECT 1 FROM products WHERE id = p_product_id) THEN
-                RETURN 1; -- PRODUCT_NOT_FOUND (404)
-            ELSE
-                RETURN 3; -- SOLD_OUT (409)
-            END IF;
-        EXCEPTION
-            WHEN unique_violation THEN
-                -- Compensate stock decrement if concurrent duplicate order entered
-                UPDATE products SET stock = stock + 1 WHERE id = p_product_id;
-                RETURN 2; -- ALREADY_PURCHASED (409)
-        END;
-        $$ LANGUAGE plpgsql;
-        "#,
-    )
-    .execute(&db)
-    .await
-    .expect("Failed to create place_order function");
-
-    // Preload existing products into memory
+    // Preload existing products into memory cache
     let mut products_map = HashMap::new();
     let mut categories_map: HashMap<String, Vec<Arc<ProductItem>>> = HashMap::new();
 
-    let existing_products = sqlx::query("SELECT id, name, category, price, stock FROM products")
-        .fetch_all(&db)
-        .await
-        .unwrap_or_default();
-
-    for row in existing_products {
-        let id: String = row.get("id");
-        let name: String = row.get("name");
-        let category: String = row.get("category");
-        let price: i64 = row.get("price");
-        let stock: i32 = row.get("stock");
-
+    let existing_products = storage.load_all_products().await.unwrap_or_default();
+    for p in existing_products {
         let item = Arc::new(ProductItem {
-            id: id.clone(),
-            name,
-            category: category.clone(),
-            price,
-            stock: AtomicI32::new(stock),
+            id: p.id.clone(),
+            name: p.name,
+            category: p.category.clone(),
+            price: p.price,
+            stock: AtomicI32::new(p.stock),
         });
-        products_map.insert(id, Arc::clone(&item));
-        categories_map.entry(category).or_default().push(item);
+        products_map.insert(p.id, Arc::clone(&item));
+        categories_map.entry(p.category).or_default().push(item);
     }
 
     for list in categories_map.values_mut() {
@@ -673,20 +497,12 @@ async fn main() {
         });
     }
 
-    // Preload existing orders into memory
+    // Preload existing orders into memory cache
     let mut user_orders_map: HashMap<String, Vec<UserOrderItem>> = HashMap::new();
     let mut user_purchases_set = HashSet::new();
 
-    let existing_orders = sqlx::query("SELECT user_id, product_id, order_id FROM orders")
-        .fetch_all(&db)
-        .await
-        .unwrap_or_default();
-
-    for row in existing_orders {
-        let user_id: String = row.get("user_id");
-        let product_id: String = row.get("product_id");
-        let order_id: String = row.get("order_id");
-
+    let existing_orders = storage.load_all_orders().await.unwrap_or_default();
+    for (order_id, user_id, product_id) in existing_orders {
         user_purchases_set.insert((user_id.clone(), product_id.clone()));
         user_orders_map
             .entry(user_id)
@@ -708,15 +524,8 @@ async fn main() {
     let user_orders = Arc::new(RwLock::new(user_orders_map));
     let user_purchases = Arc::new(RwLock::new(user_purchases_set));
 
-    // Connect to Redis
-    let redis_client = redis::Client::open(redis_url).expect("Invalid Redis URL");
-    let redis = redis::aio::ConnectionManager::new(redis_client)
-        .await
-        .expect("Failed to connect to Redis");
-
     let state = AppState {
-        db,
-        redis,
+        storage,
         products,
         categories,
         user_orders,
@@ -724,7 +533,6 @@ async fn main() {
         order_counter: Arc::new(AtomicU64::new(1)),
     };
 
-    // Define routes matching the challenge spec exactly
     let app = Router::new()
         .route("/health", get(health))
         .route("/products", post(create_product).get(list_products))
